@@ -317,78 +317,66 @@ fi
 log_info "找到 preseed.cfg: $PRESEED_FILE"
 cp "$PRESEED_FILE" "${PRESEED_FILE}.bak"
 
-# 构造 IPv6 配置片段（如果配置了 IPv6）
-IPV6_CONFIG=""
-if [ -n "${IPV6_ADDR}" ] && [ "${IPV6_ADDR}" != "none" ]; then
-    # 计算 IPv6 前缀长度（腾讯云轻量通常是 /64）
-    IPV6_PREFIX="64"
-    IPV6_CONFIG="
-echo '=== 配置 IPv6 ===';
-ip -6 addr add ${IPV6_ADDR}/${IPV6_PREFIX} dev eth0 2>/dev/null || true;
-ip -6 route add default via ${IPV6_GW} dev eth0 2>/dev/null || true;
-# 持久化 IPv6 配置
-cat >> /etc/network/interfaces << 'IPV6EOF'
+# 构造 late_command 的方式：将脚本内容写入独立文件，在 preseed 中复制到目标系统并执行
+# 这避免了多层引号嵌套的解析问题
 
-# IPv6
-iface eth0 inet6 static
-    address ${IPV6_ADDR}
-    netmask ${IPV6_PREFIX}
-    gateway ${IPV6_GW}
-IPV6EOF
-echo 'IPv6 配置完成';"
-fi
+# 找到 debi.sh 生成的安装文件目录
+INSTALLER_DIR=$(dirname "$PRESEED_FILE")
+LATE_SCRIPT_SRC="${INSTALLER_DIR}/late_command.sh"
+LATE_SCRIPT_DST="/tmp/late_command.sh"
 
-# 构造 late_command —— 这是阻止 config-drive 自恢复的核心
-# 关键措施：
-# 1. 完全卸载 cloud-init 包
-# 2. 创建禁用标记文件
-# 3. 创建 udev 规则忽略 config-drive 设备
-# 4. 黑名单 sr_mod 内核模块（阻止加载光驱驱动）
-# 5. 写入静态网络配置（因为 cloud-init 不再管理网络）
-# 6. 清理 fstab 中的 sr0 挂载
-# 7. 清理所有残留文件
-# 8. 配置 IPv6
-# 9. 创建清理 systemd 服务（第三重阻断）
-# 10. 确保 SSH 可用
-LATE_CMD='true; in-target sh -c '\''
-echo "================================================";
-echo "  第二重阻断：preseed late_command";
-echo "================================================";
+log_info "创建 late_command 脚本文件: $LATE_SCRIPT_SRC"
 
-echo "=== [1/10] 完全卸载 cloud-init ===";
-apt-get purge -y cloud-init 2>/dev/null || true;
-apt-get autoremove -y 2>/dev/null || true;
-rm -rf /etc/cloud /var/lib/cloud;
+cat > "$LATE_SCRIPT_SRC" << 'LATEEOF'
+#!/bin/sh
+# ================================================================
+#  preseed late_command 脚本（由 dd-reinstall.sh 生成）
+#  功能：三重阻断 config-drive 自恢复机制
+# ================================================================
+set -x
 
-echo "=== [2/10] 创建 cloud-init 禁用标记 ===";
-mkdir -p /etc/cloud;
-echo "cloud-init permanently disabled by DD reinstall script" > /etc/cloud/cloud-init.disabled;
+echo "================================================"
+echo "  第二重阻断：preseed late_command"
+echo "================================================"
 
-echo "=== [3/10] 创建 udev 规则忽略 config-drive ===";
-mkdir -p /etc/udev/rules.d;
-# 忽略 label 为 config-2 的设备（腾讯云 config-drive）
-echo "SUBSYSTEM==\"block\", ENV{ID_FS_LABEL}==\"config-2\", OPTIONS=\"ignore_device\"" > /etc/udev/rules.d/99-ignore-config-drive.rules;
-# 同时按设备名忽略
-echo "KERNEL==\"sr0\", OPTIONS=\"ignore_device\"" >> /etc/udev/rules.d/99-ignore-config-drive.rules;
-echo "已创建 udev 规则";
+# [1/10] 完全卸载 cloud-init
+echo "=== [1/10] 完全卸载 cloud-init ==="
+apt-get purge -y cloud-init 2>/dev/null || true
+apt-get autoremove -y 2>/dev/null || true
+rm -rf /etc/cloud /var/lib/cloud
 
-echo "=== [4/10] 黑名单 sr_mod 内核模块 ===";
-mkdir -p /etc/modprobe.d;
-echo "# 禁用光驱模块，阻止加载腾讯云 config-drive" > /etc/modprobe.d/blacklist-cdrom.conf;
-echo "blacklist sr_mod" >> /etc/modprobe.d/blacklist-cdrom.conf;
-echo "blacklist cdrom" >> /etc/modprobe.d/blacklist-cdrom.conf;
-echo "install sr_mod /bin/true" >> /etc/modprobe.d/blacklist-cdrom.conf;
-echo "install cdrom /bin/true" >> /etc/modprobe.d/blacklist-cdrom.conf;
+# [2/10] 创建 cloud-init 禁用标记
+echo "=== [2/10] 创建 cloud-init 禁用标记 ==="
+mkdir -p /etc/cloud
+echo "cloud-init permanently disabled by DD reinstall script" > /etc/cloud/cloud-init.disabled
 
-echo "=== [5/10] 清理 fstab ===";
-sed -i "/sr0/d" /etc/fstab;
-sed -i "/config-2/d" /etc/fstab;
-sed -i "/cdrom/d" /etc/fstab;
-echo "已从 fstab 中移除 sr0/cdrom 挂载";
+# [3/10] 创建 udev 规则忽略 config-drive
+echo "=== [3/10] 创建 udev 规则忽略 config-drive ==="
+mkdir -p /etc/udev/rules.d
+echo 'SUBSYSTEM=="block", ENV{ID_FS_LABEL}=="config-2", OPTIONS="ignore_device"' > /etc/udev/rules.d/99-ignore-config-drive.rules
+echo 'KERNEL=="sr0", OPTIONS="ignore_device"' >> /etc/udev/rules.d/99-ignore-config-drive.rules
 
-echo "=== [6/10] 写入静态网络配置 ===";
-mkdir -p /etc/network;
-cat > /etc/network/interfaces << "NETEOF";
+# [4/10] 黑名单 sr_mod 内核模块
+echo "=== [4/10] 黑名单 sr_mod 内核模块 ==="
+mkdir -p /etc/modprobe.d
+cat > /etc/modprobe.d/blacklist-cdrom.conf << 'MEOF'
+# 禁用光驱模块，阻止加载腾讯云 config-drive
+blacklist sr_mod
+blacklist cdrom
+install sr_mod /bin/true
+install cdrom /bin/true
+MEOF
+
+# [5/10] 清理 fstab
+echo "=== [5/10] 清理 fstab ==="
+sed -i '/sr0/d' /etc/fstab
+sed -i '/config-2/d' /etc/fstab
+sed -i '/cdrom/d' /etc/fstab
+
+# [6/10] 写入静态网络配置
+echo "=== [6/10] 写入静态网络配置 ==="
+mkdir -p /etc/network
+cat > /etc/network/interfaces << 'NETEOF'
 # This file describes the network interfaces available on your system
 # and how to activate them. For more information, see interfaces(5).
 
@@ -403,70 +391,101 @@ allow-hotplug eth0
 iface eth0 inet dhcp
 auto eth0
 NETEOF
-echo "已写入网络配置（DHCP 模式）";
 
-echo "=== [7/10] 配置 DNS ===";
-rm -f /etc/resolv.conf;
-cat > /etc/resolv.conf << "DNSEOF";
+# [7/10] 配置 DNS
+echo "=== [7/10] 配置 DNS ==="
+rm -f /etc/resolv.conf
+cat > /etc/resolv.conf << 'DNSEOF'
 nameserver 183.60.83.19
 nameserver 183.60.82.98
 DNSEOF
-# 防止被覆盖
-chattr +i /etc/resolv.conf 2>/dev/null || true;
+chattr +i /etc/resolv.conf 2>/dev/null || true
 
-echo "=== [8/10] 清理残留文件 ===";
-rm -rf /qcloud_init /usr/local/qcloud /etc/qcloudzone;
-rm -rf /var/lib/cloud;
-rm -f /etc/profile.d/go_conf.sh;
-rm -f /etc/tencentcloud_ipv6_base.sh;
-rm -f /etc/ld.so.preload;
-rm -rf /opt/qcloud /opt/tencent;
+# [8/10] 清理残留文件
+echo "=== [8/10] 清理残留文件 ==="
+rm -rf /qcloud_init /usr/local/qcloud /etc/qcloudzone
+rm -rf /var/lib/cloud
+rm -f /etc/profile.d/go_conf.sh
+rm -f /etc/tencentcloud_ipv6_base.sh
+rm -f /etc/ld.so.preload
+rm -rf /opt/qcloud /opt/tencent
 
-echo "=== [9/10] SSH 配置 ===";
-if [ ! -e "/etc/ssh/sshd_config.backup" ]; then
-    cp "/etc/ssh/sshd_config" "/etc/ssh/sshd_config.backup" 2>/dev/null || true;
-fi;
-sed -Ei "s/^#?PermitRootLogin .+/PermitRootLogin yes/" /etc/ssh/sshd_config 2>/dev/null || true;
-sed -Ei "s/^#?PasswordAuthentication .+/PasswordAuthentication yes/" /etc/ssh/sshd_config 2>/dev/null || true;
-echo "${NEW_USER} ALL=(ALL:ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-user-${NEW_USER}" 2>/dev/null || true;
-chmod 440 "/etc/sudoers.d/90-user-${NEW_USER}" 2>/dev/null || true;
+# [9/10] SSH 配置
+echo "=== [9/10] SSH 配置 ==="
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup 2>/dev/null || true
+sed -Ei 's/^#?PermitRootLogin .+/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null || true
+sed -Ei 's/^#?PasswordAuthentication .+/PasswordAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
 
-echo "=== [10/10] BBR + 内核参数 ===";
-mkdir -p /etc/sysctl.d;
-{ echo "net.core.default_qdisc=fq"; echo "net.ipv4.tcp_congestion_control=bbr"; } > /etc/sysctl.d/bbr.conf;
-# 禁用 IPv6 自动配置（防止被 cloud-init 残留干扰）
-{ echo "net.ipv6.conf.all.autoconf=0"; echo "net.ipv6.conf.eth0.autoconf=0"; } > /etc/sysctl.d/disable-ipv6-autoconf.conf;
+# [10/10] BBR + 内核参数
+echo "=== [10/10] BBR + 内核参数 ==="
+mkdir -p /etc/sysctl.d
+echo 'net.core.default_qdisc=fq' > /etc/sysctl.d/bbr.conf
+echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.d/bbr.conf
+echo 'net.ipv6.conf.all.autoconf=0' > /etc/sysctl.d/disable-ipv6-autoconf.conf
+echo 'net.ipv6.conf.eth0.autoconf=0' >> /etc/sysctl.d/disable-ipv6-autoconf.conf
+LATEEOF
 
-'"${IPV6_CONFIG}"'
+# IPv6 配置（追加到 late_command 脚本）
+if [ -n "${IPV6_ADDR}" ] && [ "${IPV6_ADDR}" != "none" ]; then
+    IPV6_PREFIX="64"
+    cat >> "$LATE_SCRIPT_SRC" << IPV6BLOCK
 
-echo "=== 创建第三重阻断 systemd 服务 ===";
-# 这个服务会在新系统首次启动时运行，做最终清理
-cat > /etc/systemd/system/tencent-cleanup.service << "SVCEOF"
+# IPv6 配置
+echo '=== 配置 IPv6 ==='
+ip -6 addr add ${IPV6_ADDR}/${IPV6_PREFIX} dev eth0 2>/dev/null || true
+ip -6 route add default via ${IPV6_GW} dev eth0 2>/dev/null || true
+cat >> /etc/network/interfaces << 'IPV6EOF'
+
+# IPv6
+iface eth0 inet6 static
+    address ${IPV6_ADDR}
+    netmask ${IPV6_PREFIX}
+    gateway ${IPV6_GW}
+IPV6EOF
+echo 'IPv6 配置完成'
+IPV6BLOCK
+fi
+
+# 第三重阻断：systemd 清理服务 + sudoer 配置（追加）
+cat >> "$LATE_SCRIPT_SRC" << 'LATEEOF2'
+
+# 第三重阻断 systemd 服务
+echo '=== 创建第三重阻断 systemd 服务 ==='
+cat > /etc/systemd/system/tencent-cleanup.service << 'SVCEOF'
 [Unit]
 Description=Tencent Cloud Config-Drive Cleanup (One-shot)
 DefaultDependencies=no
 After=local-fs.target
 Before=network-pre.target
-ConditionPathExists=/etc/cloud/cloud-init.disabled
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c "echo 'third barrier: cleaning config-drive remnants'; modprobe -r sr_mod 2>/dev/null || true; rm -rf /var/lib/cloud /qcloud_init /usr/local/qcloud /etc/qcloudzone 2>/dev/null; mkdir -p /etc/cloud; echo disabled > /etc/cloud/cloud-init.disabled; echo cleanup done"
+ExecStart=/bin/sh -c 'modprobe -r sr_mod 2>/dev/null; rm -rf /var/lib/cloud /qcloud_init /usr/local/qcloud /etc/qcloudzone 2>/dev/null; mkdir -p /etc/cloud; echo disabled > /etc/cloud/cloud-init.disabled'
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
-systemctl enable tencent-cleanup.service 2>/dev/null || true;
+systemctl enable tencent-cleanup.service 2>/dev/null || true
 
-echo "=== 完成：三重阻断全部就绪 ==="
-'\'''
+echo '=== 完成：三重阻断全部就绪 ==='
+LATEEOF2
+
+chmod +x "$LATE_SCRIPT_SRC"
+log_info "late_command 脚本已创建 ($(wc -l < "$LATE_SCRIPT_SRC") 行)"
+
+# 在 preseed 中，late_command 将脚本复制到目标系统并执行
+# preseed 的 late_command 格式：d-i preseed/late_command string <command>
+# 我们用 cp 把脚本从安装环境复制到目标系统的 /tmp，然后在 in-target 中执行
+# 安装环境中，目标系统挂载在 /target
 
 # 替换 preseed 中的 late_command
 sed -i '/^d-i preseed\/late_command/d' "$PRESEED_FILE"
+# 复制脚本到目标系统并在目标系统中执行
+cp "$LATE_SCRIPT_SRC" /target"${LATE_SCRIPT_DST}" 2>/dev/null || true
 echo "" >> "$PRESEED_FILE"
 echo "# 阻断 config-drive 自恢复（三重阻断：preseed late_command）" >> "$PRESEED_FILE"
-echo "d-i preseed/late_command string $LATE_CMD" >> "$PRESEED_FILE"
+echo "d-i preseed/late_command string in-target /bin/sh ${LATE_SCRIPT_DST}" >> "$PRESEED_FILE"
 
 # 在 pkgsel 中排除 cloud-init
 if ! grep -q "cloud-init" "$PRESEED_FILE" 2>/dev/null; then
