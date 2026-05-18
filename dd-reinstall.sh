@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ================================================================
-# 腾讯云 DD 重装 Debian 12 脚本 v2.0（彻底解决 config-drive 自恢复）
+# 腾讯云 DD 重装 Debian 12 脚本 v2.1（内置 config-drive 阻断 + kexec 直跳）
 # ================================================================
 # 适用：腾讯云 CVM、轻量应用服务器（Lighthouse）
 # 要求：root 权限、Debian 系列系统（用于运行此脚本）
@@ -14,12 +14,13 @@
 #   - runcmd: 执行 cvm_init.sh（安装 YunJing + Stargate + TAT + Barad 等全部组件）
 #   - runcmd: 设置 root 密码、hostname、ntp 等
 #   - write_files: 写入 /etc/uuid
-#   无论你 DD 什么新系统，cloud-init 检测到 config-drive 后都会重新安装腾讯组件
+#   新系统若启用 cloud-init 并读取 config-drive，腾讯组件可能被重新安装
 #
-# 解决方案（三重阻断）：
+# 解决方案：
 #   第一重：安装前（当前系统）—— 卸载并禁用 config-drive，阻止 cloud-init 写入缓存
 #   第二重：preseed 阶段 —— 在 late_command 中彻底禁用 cloud-init 和 sr_mod
 #   第三重：新系统首次启动 —— 通过 systemd 服务做最终清理和验证
+#   启动兜底：优先用 kexec 直接进入 Debian Installer，绕过不消费 grubenv 的平台启动链
 #
 # 使用方法：
 #   scp dd-reinstall.sh root@<IP>:/root/
@@ -29,15 +30,15 @@
 set -euo pipefail
 
 # ======================== 配置 ========================
-# 新系统配置
-NEW_USER="debian"
-NEW_PASSWORD="Tadminn.."
-NEW_SSH_PORT=8622
-NEW_HOSTNAME="TX-BJ"
-TIMEZONE="Asia/Shanghai"
+# 新系统配置（可通过环境变量覆盖；不要把密码写入公开脚本）
+NEW_USER="${NEW_USER:-debian}"
+NEW_PASSWORD="${NEW_PASSWORD:-}"
+NEW_SSH_PORT="${NEW_SSH_PORT:-8622}"
+NEW_HOSTNAME="${NEW_HOSTNAME:-debian}"
+TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 
 # IPv6（腾讯云控制台分配的地址，留空则不配置 IPv6）
-IPV6_ADDR="${TENCENT_IPV6:-2402:4e00:c052:1a00:3c86:4bce:d262:0}"
+IPV6_ADDR="${TENCENT_IPV6:-}"
 IPV6_GW="${TENCENT_IPV6_GW:-fe80::1}"
 
 # debi.sh 下载地址（多重备选，适合中国网络环境）
@@ -56,6 +57,11 @@ SECURITY_REPO="http://mirrors.tencentyun.com/debian-security/"
 # DNS（腾讯内网 DNS）
 DNS_SERVERS="183.60.83.19 183.60.82.98"
 
+# 启动方式：默认 kexec，绕过部分腾讯云轻量实例不消费 grubenv/GRUB_DEFAULT 的问题
+BOOT_METHOD="${BOOT_METHOD:-kexec}"
+KEXEC_CMDLINE="${KEXEC_CMDLINE:-auto=true priority=critical net.ifnames=0 biosdevname=0 lowmem/low=1 console=ttyS0,115200 console=tty0}"
+INSTALL_KEXEC_TOOLS="${INSTALL_KEXEC_TOOLS:-1}"
+
 # ======================== 颜色 ========================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -67,27 +73,119 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 log_step()  { echo -e "\n${CYAN}======== $* =======${NC}"; }
 log_fail()  { echo -e "${RED}[FAIL]${NC}  $*"; }
 
+ensure_kexec() {
+    command -v kexec >/dev/null 2>&1 && return 0
+    [ "$INSTALL_KEXEC_TOOLS" = "1" ] || return 1
+
+    log_warn "未找到 kexec，尝试安装 kexec-tools"
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y kexec-tools >/dev/null 2>&1 || {
+            DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive apt-get install -y kexec-tools >/dev/null 2>&1
+        }
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y kexec-tools >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y kexec-tools >/dev/null 2>&1
+    fi
+
+    command -v kexec >/dev/null 2>&1
+}
+
+append_preseed_to_initrd() {
+    local preseed="$1"
+    local dir initrd tmp backup
+
+    dir=$(dirname "$preseed")
+    initrd=""
+    for i in "$dir"/initrd.gz "$dir"/initrd*; do
+        [ -f "$i" ] && initrd="$i" && break
+    done
+
+    if [ -z "$initrd" ]; then
+        log_fail "找不到 Debian Installer initrd"
+        exit 1
+    fi
+    if ! command -v cpio >/dev/null 2>&1; then
+        log_fail "未找到 cpio，无法把修补后的 preseed.cfg 嵌入 initrd"
+        exit 1
+    fi
+
+    backup="${initrd}.bak.preseed.$(date +%s)"
+    cp "$initrd" "$backup"
+    tmp=$(mktemp -d)
+    cp "$preseed" "$tmp/preseed.cfg"
+    (cd "$tmp" && find preseed.cfg | cpio -H newc -o 2>/dev/null | gzip -c >> "$initrd")
+    rm -rf "$tmp"
+    log_info "已将修补后的 preseed.cfg 追加嵌入 initrd，原 initrd 备份为 $backup"
+}
+
+boot_debian_installer() {
+    local preseed="$1"
+    local dir kernel initrd
+
+    dir=$(dirname "$preseed")
+    kernel=""
+    initrd=""
+    for k in "$dir"/linux "$dir"/vmlinuz*; do
+        [ -f "$k" ] && kernel="$k" && break
+    done
+    for i in "$dir"/initrd.gz "$dir"/initrd*; do
+        [ -f "$i" ] && initrd="$i" && break
+    done
+
+    if [ -z "$kernel" ] || [ -z "$initrd" ]; then
+        log_fail "找不到 Debian Installer kernel/initrd"
+        exit 1
+    fi
+
+    if [ "$BOOT_METHOD" != "reboot" ] && ensure_kexec; then
+        log_info "使用 kexec 直接进入 Debian Installer，绕过 GRUB/grubenv"
+        kexec -l "$kernel" --initrd="$initrd" --command-line="$KEXEC_CMDLINE"
+        sync
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+            systemctl kexec
+        else
+            kexec -e
+        fi
+    fi
+
+    log_warn "kexec 不可用，回退为普通 reboot；若重启仍回旧系统，请运行 kexec_debi_installer.sh"
+    reboot
+}
+
 # ======================== 检查 root ========================
 if [ "$(id -u)" -ne 0 ]; then
     log_fail "请使用 root 用户运行此脚本"
     exit 1
 fi
 
+if [ -z "$NEW_PASSWORD" ]; then
+    if [ -t 0 ]; then
+        read -r -s -p "请输入新系统 ${NEW_USER} 的 SSH 密码: " NEW_PASSWORD
+        echo ""
+    else
+        log_fail "未设置 NEW_PASSWORD，非交互环境请用环境变量传入"
+        exit 1
+    fi
+fi
+
 # ======================== 显示配置 ========================
 echo ""
 echo "============================================================"
-echo "     腾讯云 DD 重装 Debian 12 脚本 v2.0"
-echo "     （彻底解决 config-drive 自恢复问题）"
+echo "     腾讯云 DD 重装 Debian 12 脚本 v2.1"
+echo "     （内置 config-drive 阻断 + kexec 直跳）"
 echo "============================================================"
 echo ""
 echo "新系统配置："
 echo "  用户名：${NEW_USER}"
-echo "  密码：${NEW_PASSWORD}"
+echo "  密码：已设置（不回显）"
 echo "  SSH 端口：${NEW_SSH_PORT}"
 echo "  主机名：${NEW_HOSTNAME}"
 echo "  时区：${TIMEZONE}"
 echo "  镜像源：${MIRROR_HOST}（腾讯内网加速）"
-echo "  IPv6：${IPV6_ADDR}"
+echo "  IPv6：${IPV6_ADDR:-未配置}"
+echo "  启动方式：${BOOT_METHOD}"
 echo ""
 
 # ======================== 阶段 0：系统信息收集 ========================
@@ -496,6 +594,7 @@ if ! grep -q "cloud-init" "$PRESEED_FILE" 2>/dev/null; then
 fi
 
 log_info "preseed.cfg 修补完成"
+append_preseed_to_initrd "$PRESEED_FILE"
 
 # ================================================================
 #  验证
@@ -529,7 +628,7 @@ echo "  ✅ 三重阻断配置全部完成！"
 echo ""
 echo "  新系统配置："
 echo "    用户名：${NEW_USER}"
-echo "    密码：${NEW_PASSWORD}"
+echo "    密码：已设置（不回显）"
 echo "    SSH 端口：${NEW_SSH_PORT}"
 echo "    主机名：${NEW_HOSTNAME}"
 echo "    镜像源：${MIRROR_HOST}（腾讯内网加速）"
@@ -546,17 +645,19 @@ echo "    ssh -p ${NEW_SSH_PORT} ${NEW_USER}@$(hostname -I | awk '{print $1}')"
 echo ""
 echo -e "  ${RED}注意：重装过程需要 10-20 分钟，请耐心等待${NC}"
 echo "  ${RED}注意：如果 SSH 连不上，请等待几分钟后再试${NC}"
+echo "  启动方式：${BOOT_METHOD}（默认优先 kexec，避免重启回旧系统）"
 echo "============================================================"
 echo ""
 
-read -r -p "现在重启进入 Debian Installer？输入 REBOOT ：" REBOOT_CONFIRM
+read -r -p "现在进入 Debian Installer？输入 BOOT ：" BOOT_CONFIRM
 
-if [ "${REBOOT_CONFIRM}" = "REBOOT" ]; then
-    log_info "3 秒后重启..."
+if [ "${BOOT_CONFIRM}" = "BOOT" ] || [ "${BOOT_CONFIRM}" = "REBOOT" ]; then
+    log_info "3 秒后进入 Debian Installer..."
     sleep 3
-    reboot
+    boot_debian_installer "$PRESEED_FILE"
 else
-    echo "未重启。你稍后可以手动执行：reboot"
+    echo "未启动安装器。你稍后可以执行："
+    echo "  KEXEC_CONFIRM=1 bash /root/kexec_debi_installer.sh"
     echo ""
     echo "重装完成后，请用以下命令连接新系统："
     echo "  ssh -p ${NEW_SSH_PORT} ${NEW_USER}@$(hostname -I | awk '{print $1}')"

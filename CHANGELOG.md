@@ -1,9 +1,39 @@
 # 变更日志
 
+## v3.4 (2026-05-18)
+
+### 新增
+- 新增 `kexec_debi_installer.sh`：debi.sh 已生成 `/boot/debian-*` 后，可绕过 GRUB 直接进入 Debian Installer。
+- `dd-reinstall.sh` 升级到 v2.1，默认优先使用 kexec 进入安装器，避免腾讯云轻量实例重启后仍回旧系统。
+
+### 修复
+- `dd-reinstall.sh` 修补 preseed 后会重新追加嵌入 initrd，确保 late_command 在安装器中生效。
+- `verify_cleanup.sh` 新增当前 `/proc/cmdline` 检查，识别实际启动链未消费当前 GRUB 参数的情况。
+
+## v3.3 (2026-05-18)
+
+### 修复
+- 修正 `grub-editenv` 清理语法，确保 Debian 上真正清除 `recordfail`/`next_entry`。
+- BIOS 模式下自动将 GRUB 重新安装到根分区所在系统盘，避免实际启动链绕过当前 `/boot/grub/grub.cfg`。
+- `verify_cleanup.sh` 同时识别 `grubenv` 和 `GRUB_DEFAULT` 指向安装器，减少误报。
+
+## v3.2 (2026-05-18)
+
+### 新增
+- 将 DD 修复方向调整为“通用系统前置修复”，不依赖修改某一个 DD 脚本。
+- `remove_tencent_cloud.sh` 写入 `/etc/default/grub.d/99-tencent-dd-safe.cfg`，追加 `cloud-init=disabled`、`ds=nocloud`、`modprobe.blacklist=sr_mod,cdrom`。
+- 刷新 initramfs/dracut 与 GRUB，清理 `grubenv` 中的 `recordfail`/`next_entry`，降低重启直接回旧系统的概率。
+- `verify_cleanup.sh` 增加通用 DD GRUB 参数验证。
+
+### 改进
+- 保留腾讯云 DNS、NTP 和腾讯云内网 apt 源，适配中国大陆服务器网络环境。
+- 文档明确区分“VNC 直接进旧系统”和“新系统启动后组件复生”两类问题。
+- 移除公开脚本中的硬编码密码和默认 IPv6，改为环境变量或交互输入。
+
 ## v3.1 (2026-05-18)
 
 ### 新增
-- **config-drive 阻断（DD 重装关键！）**：彻底解决 vendor_data.json 导致的 DD 后系统自恢复问题
+- **config-drive 阻断（DD 重装关键！）**：降低 vendor_data.json 在新系统首次启动后重新安装腾讯组件的风险
   - 卸载 `/dev/sr0` 并从 fstab 中删除
   - 创建 udev 规则忽略 label=config-2 设备（`99-ignore-config-drive.rules`）
   - 黑名单 `sr_mod`/`cdrom` 内核模块（`/etc/modprobe.d/blacklist-cdrom.conf`）
@@ -31,8 +61,8 @@
 - 清理 `networking.service` 中嵌入的腾讯 IPv6 脚本调用
 - 清理 `/etc/environment` 中的腾讯 Go 代理
 - 清理 `/etc/profile.d/go_conf.sh` 腾讯代理脚本
-- 自动替换 NTP 服务器为 `pool.ntp.org`
-- 自动替换 apt 源为 Debian/Ubuntu 官方源
+- 旧版曾自动替换 NTP 服务器为 `pool.ntp.org`（v3.2 起默认保留腾讯云 NTP）
+- 旧版曾将 apt 源切到 Debian/Ubuntu 官方源（v3.2 起默认保留腾讯云内网源）
 - 清理 cloud-init 模块执行标记（sem 文件），防止重启后恢复配置
 - 清理 cloud-init part-001（lighthouse 用户创建脚本）
 - 检查并清理 at 定时任务

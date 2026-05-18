@@ -1,6 +1,6 @@
 #!/bin/bash
 # ================================================================
-# 腾讯云全家桶一键清理脚本 v3.0
+# 腾讯云全家桶一键清理脚本 v3.4
 # ================================================================
 # 适用系统：Debian / Ubuntu / CentOS 等 Linux 发行版
 # 适用场景：腾讯云 CVM、轻量应用服务器（Lighthouse）
@@ -10,7 +10,7 @@
 #
 # 警告：执行后腾讯云控制台的监控、自动化助手、主机安全等功能
 #       将全部失效，且无法通过控制台重装恢复。
-#       apt 源将替换为官方源（仅 Debian/Ubuntu 自动替换）。
+#       不修改腾讯云 DNS、NTP 和内网镜像源，适合中国大陆网络环境。
 # ================================================================
 
 set -uo pipefail
@@ -28,6 +28,80 @@ log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 log_step()    { echo -e "\n${CYAN}======== $* =======${NC}"; }
 log_fail()    { echo -e "${RED}[FAIL]${NC}  $*"; }
 log_success() { echo -e "${GREEN}[  OK ]${NC}  $*"; }
+
+run_update_grub() {
+    if command -v update-grub >/dev/null 2>&1; then
+        update-grub >/dev/null 2>&1
+    elif command -v grub-mkconfig >/dev/null 2>&1; then
+        if [ -d /boot/grub ]; then
+            grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1
+        else
+            grub-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1
+        fi
+    elif command -v grub2-mkconfig >/dev/null 2>&1; then
+        grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+update_boot_images() {
+    if command -v update-initramfs >/dev/null 2>&1; then
+        update-initramfs -u -k all >/dev/null 2>&1 && return 0
+    elif command -v dracut >/dev/null 2>&1; then
+        dracut -f --regenerate-all >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+clear_grubenv_key() {
+    local key="$1"
+    local env
+    command -v grub-editenv >/dev/null 2>&1 || return 0
+    for env in /boot/grub/grubenv /boot/grub2/grubenv; do
+        [ -f "$env" ] || continue
+        grub-editenv "$env" unset "$key" 2>/dev/null || true
+    done
+}
+
+install_grub_to_root_disk() {
+    local root_src root_disk
+    [ ! -d /sys/firmware/efi ] || return 0
+    command -v grub-install >/dev/null 2>&1 || return 0
+
+    root_src=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+    root_disk=$(lsblk -no PKNAME "$root_src" 2>/dev/null | head -n1 || true)
+    if [ -n "$root_disk" ] && [ -b "/dev/$root_disk" ]; then
+        log_info "  重新安装 BIOS GRUB 到 /dev/$root_disk"
+        grub-install --target=i386-pc --recheck "/dev/$root_disk" >/dev/null 2>&1 || \
+            log_warn "  GRUB 安装到 /dev/$root_disk 失败，请人工检查 BIOS 启动链"
+    else
+        log_warn "  无法从根分区 $root_src 识别系统盘，跳过 GRUB MBR 重装"
+    fi
+}
+
+configure_dd_safe_grub() {
+    log_info "配置通用 DD 启动安全参数（不依赖特定 DD 脚本）"
+    mkdir -p /etc/default/grub.d
+    cat > /etc/default/grub.d/99-tencent-dd-safe.cfg << 'GRUBEOF'
+# 通用 DD 前置修复：避免当前系统重启时继续读取腾讯云 config-drive
+GRUB_TIMEOUT_STYLE=menu
+GRUB_TIMEOUT=5
+GRUB_RECORDFAIL_TIMEOUT=5
+GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT:-} modprobe.blacklist=sr_mod,cdrom cloud-init=disabled ds=nocloud"
+GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX:-} modprobe.blacklist=sr_mod,cdrom cloud-init=disabled ds=nocloud"
+GRUBEOF
+
+    clear_grubenv_key recordfail
+    clear_grubenv_key next_entry
+    install_grub_to_root_disk
+
+    if run_update_grub; then
+        log_info "  已刷新 GRUB 配置"
+    else
+        log_warn "  未找到可用的 GRUB 刷新命令，请在 DD 前人工检查 GRUB"
+    fi
+}
 
 # ======================== 检测操作系统 ========================
 detect_os() {
@@ -47,7 +121,7 @@ log_info "检测到操作系统: $OS_ID"
 # ======================== 确认提示 ========================
 echo ""
 echo "============================================================"
-echo "     腾讯云全家桶一键清理脚本 v3.1"
+echo "     腾讯云全家桶一键清理脚本 v3.4"
 echo "============================================================"
 echo ""
 echo "本脚本将执行以下操作："
@@ -64,26 +138,28 @@ echo "    6. 清理 cloud-init（per-boot、runcmd、part-001）"
 echo "    7. 清理 networking.service 中嵌入的腾讯 IPv6 脚本"
 echo "    8. 清理 init.d / rc*.d 中的腾讯启动链接"
 echo "    9. 清理 udev 规则、LD_PRELOAD、shell profile 注入"
+echo "   10. 写入通用 DD 前置启动参数（GRUB + initramfs，不依赖特定 DD 脚本）"
 echo ""
 echo "  【config-drive 阻断（DD 重装关键！）】"
-log_warn "   ⭐ 10. 卸载并禁用 config-drive（/dev/sr0，vendor_data.json 自恢复根源）"
-log_warn "   ⭐ 11. 黑名单 sr_mod 内核模块 + udev 规则忽略 config-drive"
-log_warn "   ⭐ 12. 禁用 cloud-init 并清除缓存（阻止读取 vendor_data）"
+log_warn "   ⭐ 11. 卸载并禁用 config-drive（/dev/sr0，vendor_data.json 自恢复根源）"
+log_warn "   ⭐ 12. 黑名单 sr_mod 内核模块 + udev 规则忽略 config-drive"
+log_warn "   ⭐ 13. 禁用 cloud-init 并清除缓存（阻止读取 vendor_data）"
+log_warn "   ⭐ 14. 写入 cloud-init=disabled / modprobe.blacklist 到 GRUB"
 echo ""
 echo "  【文件清理】"
-echo "   13. 删除 /usr/local/qcloud、/qcloud_init 等全部目录"
-echo "   14. 删除 /tmp 下所有安装包、脚本和守护程序"
-echo "   15. 删除 tencentcloud_ipv6_base.sh 等"
-echo "   16. 清理 cgroup、pid/lock 残留"
+echo "   15. 删除 /usr/local/qcloud、/qcloud_init 等全部目录"
+echo "   16. 删除 /tmp 下所有安装包、脚本和守护程序"
+echo "   17. 删除 tencentcloud_ipv6_base.sh 等"
+echo "   18. 清理 cgroup、pid/lock 残留"
 echo ""
 echo "  【配置清理】"
-echo "   17. 清理 /etc/environment、/etc/profile.d 中的腾讯代理"
-echo "   18. 清理 cloud-init 模块执行标记（防止重启恢复）"
-echo "   19. 替换 apt 源为官方源（仅 Debian/Ubuntu 自动替换）"
+echo "   19. 清理 /etc/environment、/etc/profile.d 中的腾讯代理"
+echo "   20. 清理 cloud-init 模块执行标记（防止重启恢复）"
+echo "   21. 保留腾讯云 DNS、NTP 和内网镜像源（中国大陆网络友好）"
 echo ""
 echo -e "${RED}警告：执行后腾讯云控制台监控/安全/自动化功能将全部失效！${NC}"
-echo -e "${RED}警告：apt 源将替换为公网官方源，内网机器可能需要手动改回！${NC}"
-echo -e "${RED}警告：将禁用 cloud-init 并阻断 config-drive，DD 重装系统不再会被恢复！${NC}"
+echo -e "${YELLOW}提示：不会修改腾讯云 DNS、NTP 和内网镜像源，适合中国大陆服务器。${NC}"
+echo -e "${RED}警告：将禁用 cloud-init 并阻断 config-drive，为任意 DD 脚本提供干净启动环境！${NC}"
 echo ""
 
 # 检查 root
@@ -364,7 +440,7 @@ done
 #   - runcmd: 执行 cvm_init.sh（安装所有腾讯组件）
 #   - runcmd: 设置 root 密码、hostname、ntp
 #   - write_files: 写入 /etc/uuid
-# 无论你 DD 什么新系统，cloud-init 检测到 config-drive 就会重新安装
+# 新系统若启用 cloud-init 并读取 config-drive，腾讯组件可能被重新安装
 # ================================================================
 
 log_info "阻断 config-drive 自恢复机制"
@@ -373,6 +449,11 @@ log_info "阻断 config-drive 自恢复机制"
 if mount | grep -q "/dev/sr0"; then
     MOUNT_POINT=$(mount | grep "/dev/sr0" | awk '{print $3}')
     umount "$MOUNT_POINT" 2>/dev/null && log_info "  已卸载 config-drive ($MOUNT_POINT)" || log_warn "  卸载 config-drive 失败"
+fi
+
+# 尝试弹出虚拟光驱；如果云平台拒绝，后续 udev/modprobe/GRUB 仍会继续阻断
+if [ -b /dev/sr0 ]; then
+    eject /dev/sr0 2>/dev/null && log_info "  已请求弹出 /dev/sr0" || log_warn "  /dev/sr0 无法弹出或云平台会自动重新挂载"
 fi
 
 # 从 fstab 中删除 sr0 挂载
@@ -390,9 +471,12 @@ rm -f /etc/udev/rules.d/99-ignore-config-drive.rules
 cat > /etc/udev/rules.d/99-ignore-config-drive.rules << 'UDEVEOF'
 # 忽略腾讯云 config-drive（阻止 cloud-init 读取 vendor_data.json）
 SUBSYSTEM=="block", ENV{ID_FS_LABEL}=="config-2", OPTIONS="ignore_device"
+SUBSYSTEM=="block", ENV{ID_FS_LABEL_ENC}=="config-2", OPTIONS="ignore_device"
 KERNEL=="sr0", OPTIONS="ignore_device"
 UDEVEOF
-log_info "  已创建 udev 规则忽略 config-drive"
+udevadm control --reload-rules 2>/dev/null || true
+udevadm trigger --subsystem-match=block 2>/dev/null || true
+log_info "  已创建并加载 udev 规则忽略 config-drive"
 
 # 黑名单 sr_mod 内核模块（阻止加载光驱驱动）
 mkdir -p /etc/modprobe.d
@@ -411,13 +495,14 @@ mkdir -p /etc/cloud
 echo "cloud-init disabled by tencent-cloud-cleanup script" > /etc/cloud/cloud-init.disabled
 log_info "  已创建 /etc/cloud/cloud-init.disabled"
 
-# 停止并禁用 cloud-init 服务
+# 停止、禁用并 mask cloud-init 服务，避免任意 DD 前的重启再次读取 config-drive
 if command -v systemctl >/dev/null 2>&1; then
     for svc in cloud-init-local cloud-init cloud-config cloud-final; do
         systemctl stop "$svc" 2>/dev/null || true
         systemctl disable "$svc" 2>/dev/null || true
+        systemctl mask "$svc" 2>/dev/null || true
     done
-    log_info "  已停止并禁用 cloud-init 服务"
+    log_info "  已停止、禁用并 mask cloud-init 服务"
 fi
 
 # 清除 cloud-init 缓存（包含已解析的 vendor_data）
@@ -432,6 +517,14 @@ cloud-init:
   disabled: true
 CLOUDCFGEOF
 log_info "  已创建 cloud-init 禁用配置"
+
+# 更新当前系统 initramfs，使 sr_mod/cdrom 黑名单尽早生效；再写入 GRUB 通用 DD 参数
+if update_boot_images; then
+    log_info "  已更新 initramfs/dracut 启动镜像"
+else
+    log_warn "  未找到 update-initramfs/dracut，跳过启动镜像刷新"
+fi
+configure_dd_safe_grub
 
 log_info "config-drive 阻断完成"
 
@@ -513,64 +606,24 @@ for f in /etc/profile.d/*.sh; do
     fi
 done
 
-# 3.12 清理 /etc/ntp.conf 和 /etc/ntpsec/ntp.conf 中可能的腾讯 NTP 服务器
+# 3.12 保留腾讯云 NTP。中国大陆服务器访问海外 NTP 可能不稳定，NTP 不影响 DD 接管启动。
 for ntpfile in /etc/ntp.conf /etc/ntpsec/ntp.conf; do
     if [ -f "$ntpfile" ] && grep -qi "tencentyun\|tencent" "$ntpfile"; then
-        cp "$ntpfile" "${ntpfile}.bak.tencleanup"
-        # 替换腾讯 NTP 为公共 NTP
-        sed -i 's/time[1-5]\.tencentyun\.com/pool.ntp.org/g' "$ntpfile"
-        sed -i 's/time[1-5]\.tencent\.com/pool.ntp.org/g' "$ntpfile"
-        sed -i 's/ntp\.tencentyun\.com/pool.ntp.org/g' "$ntpfile"
-        log_info "已替换 $ntpfile 中的腾讯 NTP 为 pool.ntp.org"
+        log_info "保留 $ntpfile 中的腾讯云 NTP 配置"
     fi
 done
 
-# 3.13 替换 apt 源（Debian / Ubuntu 自动替换为官方源）
-log_info "检查 apt 源..."
+# 3.13 保留腾讯云内网 apt 源。它不参与自恢复，且中国大陆服务器通常需要内网加速源。
+log_info "检查 apt 源（保留腾讯云内网镜像）..."
 if [ -f /etc/apt/sources.list ] && grep -qi "tencentyun\|tencent" /etc/apt/sources.list; then
-    cp /etc/apt/sources.list /etc/apt/sources.list.bak.tencleanup
-
-    if echo "$OS_ID" | grep -q "^debian"; then
-        # 获取 Debian 版本代号
-        if [ -f /etc/os-release ]; then
-            . /etc/os-release
-            codename="${VERSION_CODENAME:-bookworm}"
-        else
-            codename="bookworm"
-        fi
-        cat > /etc/apt/sources.list << EOF
-# 替换为 Debian 官方源（原腾讯内网源已移除）
-deb http://deb.debian.org/debian ${codename} main contrib non-free non-free-firmware
-deb http://deb.debian.org/debian ${codename}-updates main contrib non-free non-free-firmware
-deb http://deb.debian.org/debian-security/ ${codename}-security main contrib non-free-firmware
-EOF
-        log_info "已将 apt 源替换为 Debian 官方源（原文件备份: sources.list.bak.tencleanup）"
-    elif echo "$OS_ID" | grep -q "^ubuntu"; then
-        if [ -f /etc/os-release ]; then
-            . /etc/os-release
-            codename="${VERSION_CODENAME:-jammy}"
-        else
-            codename="jammy"
-        fi
-        cat > /etc/apt/sources.list << EOF
-# 替换为 Ubuntu 官方源（原腾讯内网源已移除）
-deb http://archive.ubuntu.com/ubuntu ${codename} main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu ${codename}-updates main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu ${codename}-security main restricted universe multiverse
-EOF
-        log_info "已将 apt 源替换为 Ubuntu 官方源（原文件备份: sources.list.bak.tencleanup）"
-    else
-        log_warn "检测到腾讯 apt 源但非 Debian/Ubuntu，请手动替换 /etc/apt/sources.list"
-        log_warn "备份文件: /etc/apt/sources.list.bak.tencleanup"
-    fi
+    log_info "保留 /etc/apt/sources.list 中的腾讯云镜像源"
+elif [ -f /etc/apt/sources.list ]; then
+    log_warn "当前 apt 源未指向腾讯云镜像；若服务器无法访问海外源，请手动改回 mirrors.tencentyun.com"
 fi
 
-# 同样检查 sources.list.d 下的腾讯源
 for f in /etc/apt/sources.list.d/*; do
     if [ -f "$f" ] && grep -qi "tencentyun\|tencent" "$f"; then
-        cp "$f" "${f}.bak.tencleanup"
-        log_warn "发现腾讯源 $f，已备份并删除"
-        rm -f "$f"
+        log_info "保留 $f 中的腾讯云镜像源"
     fi
 done
 
@@ -722,9 +775,7 @@ for f in /etc/profile.d/*.sh; do
 done
 for ntpfile in /etc/ntp.conf /etc/ntpsec/ntp.conf; do
     if [ -f "$ntpfile" ] && grep -qi "tencentyun\|tencent" "$ntpfile"; then
-        log_warn "⚠️  $ntpfile 中仍有腾讯 NTP 服务器"
-        WARNINGS=$((WARNINGS + 1))
-        config_ok=false
+        log_info "保留 $ntpfile 中的腾讯云 NTP 配置"
     fi
 done
 $config_ok && log_success "✅ 配置文件已清理"
@@ -772,16 +823,31 @@ else
     log_success "✅ config-drive 未挂载"
 fi
 
-# --------------------- 4.9 apt 源检查 ---------------------
-log_info "检查 apt 源..."
-if [ -f /etc/apt/sources.list ] && grep -qi "tencentyun\|tencent" /etc/apt/sources.list; then
-    log_warn "⚠️  apt 源仍指向腾讯镜像"
-    WARNINGS=$((WARNINGS + 1))
+# --------------------- 4.9 通用 DD 启动参数检查 ---------------------
+log_info "检查通用 DD 启动参数..."
+if [ -f /etc/default/grub.d/99-tencent-dd-safe.cfg ]; then
+    if grep -q "cloud-init=disabled" /etc/default/grub.d/99-tencent-dd-safe.cfg \
+       && grep -q "modprobe.blacklist=sr_mod,cdrom" /etc/default/grub.d/99-tencent-dd-safe.cfg; then
+        log_success "✅ 通用 DD GRUB 参数已写入"
+    else
+        log_warn "⚠️  通用 DD GRUB 参数不完整"
+        WARNINGS=$((WARNINGS + 1))
+    fi
 else
-    log_success "✅ apt 源已清理"
+    log_warn "⚠️  未找到通用 DD GRUB 参数文件"
+    WARNINGS=$((WARNINGS + 1))
 fi
 
-# --------------------- 4.10 全盘扫描 ---------------------
+# --------------------- 4.10 apt 源检查 ---------------------
+log_info "检查 apt 源..."
+if [ -f /etc/apt/sources.list ] && grep -qi "tencentyun\|tencent" /etc/apt/sources.list; then
+    log_success "✅ apt 源保留腾讯云内网镜像"
+else
+    log_warn "⚠️  apt 源未指向腾讯云镜像；中国大陆服务器可能需要手动改回"
+    WARNINGS=$((WARNINGS + 1))
+fi
+
+# --------------------- 4.11 全盘扫描 ---------------------
 log_info "全盘扫描残留文件..."
 residual=$(find / -maxdepth 5 \
     \( -name "*qcloud*" -o -name "*YunJing*" -o -name "*sgagent*" -o -name "*barad_agent*" \
@@ -837,8 +903,14 @@ if [ $ERRORS -eq 0 ]; then
         echo "  # 5. 检查 systemd 自启服务"
         echo "  systemctl list-unit-files --state=enabled | grep -iE 'tat|qcloud|barad|stargate'"
         echo ""
-        echo "  # 6. 全盘扫描（应为空）"
+        echo "  # 6. 检查通用 DD 启动参数"
+        echo "  grep -E 'cloud-init=disabled|modprobe.blacklist=sr_mod,cdrom' /etc/default/grub.d/99-tencent-dd-safe.cfg"
+        echo ""
+        echo "  # 7. 全盘扫描（应为空）"
         echo "  find / -maxdepth 5 \\( -name '*qcloud*' -o -name '*YunJing*' -o -name '*tat_agent*' \\) -not -path '/proc/*' -not -path '*.bak*' 2>/dev/null"
+        echo ""
+        echo "  # 8. 若 DD 脚本重启后仍回旧系统，用 kexec 直跳 debi 安装器"
+        echo "  KEXEC_CONFIRM=1 bash /root/kexec_debi_installer.sh"
     fi
 else
     log_warn "存在未清理的项目，建议检查后再重启。"

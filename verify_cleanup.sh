@@ -1,6 +1,6 @@
 #!/bin/bash
 # ================================================================
-# 腾讯云全家桶一键清理脚本 v3.0 - 快速验证模式
+# 腾讯云全家桶一键清理脚本 v3.4 - 快速验证模式
 # ================================================================
 # 用途：在已执行清理脚本的服务器上快速验证清理结果
 # 使用：bash verify_cleanup.sh
@@ -14,6 +14,57 @@ NC='\033[0m'
 PASS=0
 FAIL=0
 WARN=0
+
+detect_boot_mode() {
+    if [ -d /sys/firmware/efi ]; then
+        echo "uefi"
+    else
+        echo "bios"
+    fi
+}
+
+first_grub_cfg() {
+    for cfg in /boot/grub/grub.cfg /boot/grub2/grub.cfg; do
+        if [ -f "$cfg" ]; then
+            echo "$cfg"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_installer_entry() {
+    local cfg="$1"
+    awk -F"'" '
+        /^menuentry / {
+            if (title != "") {
+                low=tolower(body)
+                if (low ~ /\/boot\/debian-|preseed|debi|installer|auto.*install/) { print title; exit }
+            }
+            title=$2
+            body=$0
+            next
+        }
+        title != "" { body=body "\n" $0 }
+        END {
+            if (title != "") {
+                low=tolower(body)
+                if (low ~ /\/boot\/debian-|preseed|debi|installer|auto.*install/) print title
+            }
+        }
+    ' "$cfg" | head -n1
+}
+
+has_installer_files() {
+    for dir in /boot/debian-* /boot/debian; do
+        [ -d "$dir" ] || continue
+        if find "$dir" -maxdepth 1 -type f \( -name 'linux' -o -name 'vmlinuz*' \) | grep -q . \
+           && find "$dir" -maxdepth 1 -type f \( -name 'initrd.gz' -o -name 'initrd*' \) | grep -q .; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 check() {
     local desc="$1"
@@ -159,7 +210,7 @@ $profile_ok && check "profile.d 干净" "pass"
 
 for ntpfile in /etc/ntp.conf /etc/ntpsec/ntp.conf; do
     if [ -f "$ntpfile" ] && grep -qi "tencentyun\|tencent" "$ntpfile"; then
-        check "$ntpfile" "warn" "仍包含腾讯 NTP 服务器"
+        check "$ntpfile" "pass" "保留腾讯云 NTP"
     fi
 done
 
@@ -167,9 +218,9 @@ done
 echo ""
 echo "【apt 源】"
 if [ -f /etc/apt/sources.list ] && grep -qi "tencentyun\|tencent" /etc/apt/sources.list; then
-    check "apt 源" "warn" "仍指向腾讯镜像"
+    check "apt 源" "pass" "保留腾讯云内网镜像"
 else
-    check "apt 源已清理" "pass"
+    check "apt 源" "warn" "未指向腾讯云镜像；中国大陆服务器可能无法访问海外源"
 fi
 
 # 11. config-drive 阻断
@@ -201,7 +252,72 @@ else
     check "fstab 无 sr0" "pass"
 fi
 
-# 12. 全盘扫描
+# 12. GRUB / DD 启动链
+# VNC 直接进旧系统通常说明当前系统的 GRUB/启动链没有把控制权交给 DD 脚本。
+echo ""
+echo "【GRUB / DD 启动链】"
+echo "启动模式: $(detect_boot_mode)"
+root_src=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+root_disk_name=$(lsblk -no PKNAME "$root_src" 2>/dev/null | head -n1 || true)
+if [ -n "$root_disk_name" ] && [ -b "/dev/$root_disk_name" ]; then
+    check "系统盘识别" "pass" "/dev/$root_disk_name"
+else
+    check "系统盘识别" "warn" "无法从根分区 $root_src 反查系统盘，请人工确认 DD 目标盘"
+fi
+
+cfg=$(first_grub_cfg 2>/dev/null || true)
+if [ -n "$cfg" ]; then
+    check "GRUB 配置存在" "pass" "$cfg"
+    entry=$(find_installer_entry "$cfg" || true)
+    if has_installer_files; then
+        if [ -n "$entry" ]; then
+            check "DD Installer 菜单项" "pass" "$entry"
+        else
+            check "DD Installer 菜单项" "fail" "发现 /boot/debian-* 安装文件，但 grub.cfg 没有对应菜单项；重启会回旧系统"
+        fi
+    else
+        check "DD Installer 文件" "warn" "未发现 /boot/debian-*；仅运行清理脚本时这是正常的"
+    fi
+else
+    check "GRUB 配置存在" "fail" "未找到 /boot/grub/grub.cfg 或 /boot/grub2/grub.cfg"
+fi
+
+if [ -f /etc/default/grub.d/99-tencent-dd-safe.cfg ]; then
+    if grep -q "cloud-init=disabled" /etc/default/grub.d/99-tencent-dd-safe.cfg \
+       && grep -q "modprobe.blacklist=sr_mod,cdrom" /etc/default/grub.d/99-tencent-dd-safe.cfg; then
+        check "通用 DD GRUB 参数" "pass" "/etc/default/grub.d/99-tencent-dd-safe.cfg"
+    else
+        check "通用 DD GRUB 参数" "warn" "99-tencent-dd-safe.cfg 存在但参数不完整"
+    fi
+else
+    check "通用 DD GRUB 参数" "warn" "未运行新版 remove_tencent_cloud.sh，或未写入通用 DD 前置参数"
+fi
+
+cmdline=$(tr '\n' ' ' </proc/cmdline 2>/dev/null || true)
+if [ -f /etc/default/grub.d/99-tencent-dd-safe.cfg ] \
+   && { ! echo "$cmdline" | grep -q "cloud-init=disabled" || ! echo "$cmdline" | grep -q "modprobe.blacklist=sr_mod,cdrom"; }; then
+    check "当前启动链消费 GRUB 参数" "warn" "当前 /proc/cmdline 未包含通用 DD 参数；若重启后仍回旧系统，请用 kexec_debi_installer.sh 直跳安装器"
+else
+    check "当前启动链消费 GRUB 参数" "pass"
+fi
+
+if command -v grub-editenv >/dev/null 2>&1; then
+    grubenv=$(grub-editenv list 2>/dev/null || true)
+    if echo "$grubenv" | grep -q '^recordfail=1'; then
+        check "grubenv recordfail" "warn" "recordfail=1 可能导致 GRUB 忽略下一次启动项"
+    else
+        check "grubenv recordfail" "pass"
+    fi
+    if has_installer_files \
+       && ! echo "$grubenv" | grep -qiE 'next_entry=.*(debi|installer|install)|saved_entry=.*(debi|installer|install)' \
+       && ! grep -qiE 'set default="?(debi|installer|install)' "$cfg" 2>/dev/null; then
+        check "grubenv 安装器启动项" "warn" "已发现安装器文件，但 grubenv/default 均未指向安装器；请检查 DD 脚本是否已写入 grub-reboot 或 GRUB_DEFAULT"
+    fi
+else
+    check "grubenv 工具" "warn" "未找到 grub-editenv，无法确认下一次启动项"
+fi
+
+# 13. 全盘扫描
 echo ""
 echo "【全盘扫描】"
 residual=$(find / -maxdepth 5 \

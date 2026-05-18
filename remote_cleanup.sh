@@ -4,8 +4,8 @@
 # ================================================================
 # 用途：从本地一键清理远程腾讯云服务器上的所有云盾组件
 # 使用：bash remote_cleanup.sh <IP> [SSH端口] [用户名]
-# 示例：bash remote_cleanup.sh 81.70.248.191
-#       bash remote_cleanup.sh 81.70.248.191 22 root
+# 示例：bash remote_cleanup.sh <服务器IP>
+#       bash remote_cleanup.sh <服务器IP> 22 root
 # ================================================================
 
 set -uo pipefail
