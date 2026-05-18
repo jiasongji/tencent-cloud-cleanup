@@ -124,6 +124,12 @@ for runcmd in /var/lib/cloud/instances/*/scripts/runcmd; do
 done
 $runcmd_clean && check "runcmd 已清空" "pass"
 
+if [ -f /etc/cloud/cloud-init.disabled ]; then
+    check "cloud-init 已禁用" "pass"
+else
+    check "cloud-init 已禁用" "fail" "/etc/cloud/cloud-init.disabled 不存在，config-drive 可能自恢复！"
+fi
+
 # 8. LD_PRELOAD
 echo ""
 echo "【安全检查】"
@@ -166,7 +172,36 @@ else
     check "apt 源已清理" "pass"
 fi
 
-# 11. 全盘扫描
+# 11. config-drive 阻断
+echo ""
+echo "【config-drive 阻断】"
+if [ -f /etc/cloud/cloud-init.disabled ]; then
+    check "cloud-init 禁用标记" "pass"
+else
+    check "cloud-init 禁用标记" "fail" "/etc/cloud/cloud-init.disabled 不存在"
+fi
+if [ -f /etc/udev/rules.d/99-ignore-config-drive.rules ]; then
+    check "udev 忽略 config-drive" "pass"
+else
+    check "udev 忽略 config-drive" "warn" "未配置 udev 规则"
+fi
+if [ -f /etc/modprobe.d/blacklist-cdrom.conf ]; then
+    check "sr_mod 内核模块黑名单" "pass"
+else
+    check "sr_mod 内核模块黑名单" "warn" "未黑名单 sr_mod"
+fi
+if mount | grep -q "/dev/sr0"; then
+    check "config-drive 未挂载" "warn" "config-drive 当前已挂载"
+else
+    check "config-drive 未挂载" "pass"
+fi
+if grep -q "sr0" /etc/fstab 2>/dev/null; then
+    check "fstab 无 sr0" "fail" "fstab 中仍有 sr0 挂载"
+else
+    check "fstab 无 sr0" "pass"
+fi
+
+# 12. 全盘扫描
 echo ""
 echo "【全盘扫描】"
 residual=$(find / -maxdepth 5 \
@@ -179,7 +214,7 @@ else
     check "全盘无残留" "pass"
 fi
 
-# 12. 内存
+# 13. 内存
 echo ""
 echo "【内存占用】"
 free -h | head -2

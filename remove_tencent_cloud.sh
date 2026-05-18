@@ -47,7 +47,7 @@ log_info "检测到操作系统: $OS_ID"
 # ======================== 确认提示 ========================
 echo ""
 echo "============================================================"
-echo "     腾讯云全家桶一键清理脚本 v3.0"
+echo "     腾讯云全家桶一键清理脚本 v3.1"
 echo "============================================================"
 echo ""
 echo "本脚本将执行以下操作："
@@ -65,19 +65,25 @@ echo "    7. 清理 networking.service 中嵌入的腾讯 IPv6 脚本"
 echo "    8. 清理 init.d / rc*.d 中的腾讯启动链接"
 echo "    9. 清理 udev 规则、LD_PRELOAD、shell profile 注入"
 echo ""
+echo "  【config-drive 阻断（DD 重装关键！）】"
+log_warn "   ⭐ 10. 卸载并禁用 config-drive（/dev/sr0，vendor_data.json 自恢复根源）"
+log_warn "   ⭐ 11. 黑名单 sr_mod 内核模块 + udev 规则忽略 config-drive"
+log_warn "   ⭐ 12. 禁用 cloud-init 并清除缓存（阻止读取 vendor_data）"
+echo ""
 echo "  【文件清理】"
-echo "   10. 删除 /usr/local/qcloud、/qcloud_init 等全部目录"
-echo "   11. 删除 /tmp 下所有安装包、脚本和守护程序"
-echo "   12. 删除 tencentcloud_ipv6_base.sh 等"
-echo "   13. 清理 cgroup、pid/lock 残留"
+echo "   13. 删除 /usr/local/qcloud、/qcloud_init 等全部目录"
+echo "   14. 删除 /tmp 下所有安装包、脚本和守护程序"
+echo "   15. 删除 tencentcloud_ipv6_base.sh 等"
+echo "   16. 清理 cgroup、pid/lock 残留"
 echo ""
 echo "  【配置清理】"
-echo "   14. 清理 /etc/environment、/etc/profile.d 中的腾讯代理"
-echo "   15. 清理 cloud-init 模块执行标记（防止重启恢复）"
-echo "   16. 替换 apt 源为官方源（仅 Debian/Ubuntu 自动替换）"
+echo "   17. 清理 /etc/environment、/etc/profile.d 中的腾讯代理"
+echo "   18. 清理 cloud-init 模块执行标记（防止重启恢复）"
+echo "   19. 替换 apt 源为官方源（仅 Debian/Ubuntu 自动替换）"
 echo ""
 echo -e "${RED}警告：执行后腾讯云控制台监控/安全/自动化功能将全部失效！${NC}"
 echo -e "${RED}警告：apt 源将替换为公网官方源，内网机器可能需要手动改回！${NC}"
+echo -e "${RED}警告：将禁用 cloud-init 并阻断 config-drive，DD 重装系统不再会被恢复！${NC}"
 echo ""
 
 # 检查 root
@@ -347,6 +353,88 @@ for tmpfile_dir in /etc/tmpfiles.d /usr/lib/tmpfiles.d /lib/tmpfiles.d; do
     done
 done
 
+# ================================================================
+#  2.12 config-drive 阻断（DD 重装系统的关键步骤！）
+# ================================================================
+# config-drive (/dev/sr0, label=config-2) 包含 vendor_data.json
+# 其中嵌入了完整的 cloud-init 配置：
+#   - bootcmd: 从 config-drive 复制 cloudRun.sh 到 per-boot
+#   - bootcmd: 复制 action.sh 并执行 downsr_rollback
+#   - runcmd: 挂载 config-drive, 复制 /qcloud_init/ 到根目录
+#   - runcmd: 执行 cvm_init.sh（安装所有腾讯组件）
+#   - runcmd: 设置 root 密码、hostname、ntp
+#   - write_files: 写入 /etc/uuid
+# 无论你 DD 什么新系统，cloud-init 检测到 config-drive 就会重新安装
+# ================================================================
+
+log_info "阻断 config-drive 自恢复机制"
+
+# 卸载已挂载的 config-drive
+if mount | grep -q "/dev/sr0"; then
+    MOUNT_POINT=$(mount | grep "/dev/sr0" | awk '{print $3}')
+    umount "$MOUNT_POINT" 2>/dev/null && log_info "  已卸载 config-drive ($MOUNT_POINT)" || log_warn "  卸载 config-drive 失败"
+fi
+
+# 从 fstab 中删除 sr0 挂载
+if grep -q "sr0" /etc/fstab 2>/dev/null; then
+    cp /etc/fstab /etc/fstab.bak.tencleanup
+    sed -i '/sr0/d' /etc/fstab
+    log_info "  已从 fstab 中移除 sr0 挂载"
+fi
+
+# 创建 udev 规则忽略 config-drive
+# label=config-2 是腾讯云 config-drive 的固定标签
+mkdir -p /etc/udev/rules.d
+# 先删除旧规则（如果存在）
+rm -f /etc/udev/rules.d/99-ignore-config-drive.rules
+cat > /etc/udev/rules.d/99-ignore-config-drive.rules << 'UDEVEOF'
+# 忽略腾讯云 config-drive（阻止 cloud-init 读取 vendor_data.json）
+SUBSYSTEM=="block", ENV{ID_FS_LABEL}=="config-2", OPTIONS="ignore_device"
+KERNEL=="sr0", OPTIONS="ignore_device"
+UDEVEOF
+log_info "  已创建 udev 规则忽略 config-drive"
+
+# 黑名单 sr_mod 内核模块（阻止加载光驱驱动）
+mkdir -p /etc/modprobe.d
+cat > /etc/modprobe.d/blacklist-cdrom.conf << 'MODPROBEEOF'
+# 禁用光驱模块，阻止加载腾讯云 config-drive
+blacklist sr_mod
+blacklist cdrom
+install sr_mod /bin/true
+install cdrom /bin/true
+MODPROBEEOF
+log_info "  已黑名单 sr_mod/cdrom 内核模块"
+
+# 禁用 cloud-init（这是最关键的一步）
+# 即使 udev 和 modprobe 阻止了设备加载，cloud-init 可能通过其他方式检测到
+mkdir -p /etc/cloud
+echo "cloud-init disabled by tencent-cloud-cleanup script" > /etc/cloud/cloud-init.disabled
+log_info "  已创建 /etc/cloud/cloud-init.disabled"
+
+# 停止并禁用 cloud-init 服务
+if command -v systemctl >/dev/null 2>&1; then
+    for svc in cloud-init-local cloud-init cloud-config cloud-final; do
+        systemctl stop "$svc" 2>/dev/null || true
+        systemctl disable "$svc" 2>/dev/null || true
+    done
+    log_info "  已停止并禁用 cloud-init 服务"
+fi
+
+# 清除 cloud-init 缓存（包含已解析的 vendor_data）
+rm -rf /var/lib/cloud/* 2>/dev/null || true
+log_info "  已清除 cloud-init 缓存"
+
+# 创建 cloud-init 配置覆盖（即使 cloud-init 被重新安装也不会执行）
+mkdir -p /etc/cloud/cloud.cfg.d
+cat > /etc/cloud/cloud.cfg.d/99-disable.cfg << 'CLOUDCFGEOF'
+# 完全禁用 cloud-init（由 tencent-cloud-cleanup 创建）
+cloud-init:
+  disabled: true
+CLOUDCFGEOF
+log_info "  已创建 cloud-init 禁用配置"
+
+log_info "config-drive 阻断完成"
+
 log_info "自恢复链阻断完成"
 
 # ================================================================
@@ -597,7 +685,15 @@ for runcmd in /var/lib/cloud/instances/*/scripts/runcmd; do
         cloud_ok=false
     fi
 done
-$cloud_ok && log_success "✅ cloud-init 已清理"
+
+# cloud-init 禁用检查
+if [ ! -f /etc/cloud/cloud-init.disabled ]; then
+    log_fail "❌ /etc/cloud/cloud-init.disabled 不存在"
+    ERRORS=$((ERRORS + 1))
+    cloud_ok=false
+fi
+
+$cloud_ok && log_success "✅ cloud-init 已禁用并清理"
 
 # --------------------- 4.7 LD_PRELOAD 检查 ---------------------
 log_info "检查 LD_PRELOAD..."
@@ -632,6 +728,49 @@ for ntpfile in /etc/ntp.conf /etc/ntpsec/ntp.conf; do
     fi
 done
 $config_ok && log_success "✅ 配置文件已清理"
+
+# --------------------- 4.10 config-drive 阻断检查 ---------------------
+log_info "检查 config-drive 阻断..."
+configdrive_ok=true
+
+if [ -f /etc/cloud/cloud-init.disabled ]; then
+    log_success "✅ cloud-init 已禁用（/etc/cloud/cloud-init.disabled）"
+else
+    log_fail "❌ cloud-init 未禁用！config-drive 自恢复可能生效"
+    ERRORS=$((ERRORS + 1))
+    configdrive_ok=false
+fi
+
+if [ -f /etc/udev/rules.d/99-ignore-config-drive.rules ]; then
+    log_success "✅ udev 规则已配置（忽略 config-drive）"
+else
+    log_warn "⚠️  未找到 config-drive udev 忽略规则"
+    WARNINGS=$((WARNINGS + 1))
+    configdrive_ok=false
+fi
+
+if [ -f /etc/modprobe.d/blacklist-cdrom.conf ]; then
+    log_success "✅ sr_mod 内核模块已黑名单"
+else
+    log_warn "⚠️  未找到 sr_mod 黑名单配置"
+    WARNINGS=$((WARNINGS + 1))
+    configdrive_ok=false
+fi
+
+if grep -q "sr0" /etc/fstab 2>/dev/null; then
+    log_fail "❌ fstab 中仍有 sr0 挂载"
+    ERRORS=$((ERRORS + 1))
+    configdrive_ok=false
+else
+    log_success "✅ fstab 无 sr0 挂载"
+fi
+
+if mount | grep -q "/dev/sr0"; then
+    log_warn "⚠️  config-drive 当前已挂载（重启后将被 udev/modprobe 阻止）"
+    WARNINGS=$((WARNINGS + 1))
+else
+    log_success "✅ config-drive 未挂载"
+fi
 
 # --------------------- 4.9 apt 源检查 ---------------------
 log_info "检查 apt 源..."
