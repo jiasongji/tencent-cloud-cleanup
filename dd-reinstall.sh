@@ -272,7 +272,7 @@ bash "${DEBI_SH}" \
   --cloud-kernel \
   --timezone "${TIMEZONE}" \
   --ntp 'ntp.tencent.com' \
-  --dns ${DNS_SERVERS} \
+  --dns "${DNS_SERVERS}" \
   --mirror-protocol http \
   --mirror-host "${MIRROR_HOST}" \
   --mirror-directory "${MIRROR_DIR}" \
