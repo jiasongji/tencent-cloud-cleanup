@@ -102,14 +102,14 @@ ssh root@<服务器IP> 'bash /tmp/remove_tencent_cloud.sh'
 ### 方式二：curl 下载运行
 
 ```bash
-curl -sL https://raw.githubusercontent.com/<user>/tencent-cloud-cleanup/main/remove_tencent_cloud.sh -o remove_tencent_cloud.sh
+curl -sL https://raw.githubusercontent.com/jiasongji/tencent-cloud-cleanup/main/remove_tencent_cloud.sh -o remove_tencent_cloud.sh
 bash remove_tencent_cloud.sh
 ```
 
 ### 方式三：一键执行
 
 ```bash
-curl -sL https://raw.githubusercontent.com/<user>/tencent-cloud-cleanup/main/remove_tencent_cloud.sh | bash
+curl -sL https://raw.githubusercontent.com/jiasongji/tencent-cloud-cleanup/main/remove_tencent_cloud.sh | bash
 ```
 
 > 注意：方式三无法使用交互式确认，需要先修改脚本中的 `confirm` 变量或使用 `echo "yes" |` 管道输入。
