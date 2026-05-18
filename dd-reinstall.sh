@@ -258,6 +258,14 @@ log_step "配置 Debian 安装"
 rm -rf /etc/default/grub.d/zz-debi.cfg /boot/debian-* 2>/dev/null || true
 update-grub 2>/dev/null || grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null || true
 
+# 注意：debi.sh 内部使用 stty -echo 读取密码，在非 PTY 环境会失败
+# 即使已通过 --password 提供密码，stty 仍会报错
+# 解决方案：patch debi.sh 跳过 stty 调用
+sed -i 's/^stty -echo$/# stty -echo/' "${DEBI_SH}"
+sed -i "s/^    stty echo$/    # stty echo/" "${DEBI_SH}"
+sed -i "s/trap 'stty echo' EXIT/# trap 'stty echo' EXIT/" "${DEBI_SH}"
+log_info "已修补 debi.sh（跳过 stty 调用）"
+
 # 执行 debi.sh
 # 注意：--ethx 让网卡名使用 eth0 格式（而不是 ens5 等预测命名）
 # 注意：使用腾讯内网镜像源，无需代理
