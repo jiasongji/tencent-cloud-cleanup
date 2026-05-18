@@ -474,18 +474,20 @@ LATEEOF2
 chmod +x "$LATE_SCRIPT_SRC"
 log_info "late_command 脚本已创建 ($(wc -l < "$LATE_SCRIPT_SRC") 行)"
 
-# 在 preseed 中，late_command 将脚本复制到目标系统并执行
-# preseed 的 late_command 格式：d-i preseed/late_command string <command>
-# 我们用 cp 把脚本从安装环境复制到目标系统的 /tmp，然后在 in-target 中执行
-# 安装环境中，目标系统挂载在 /target
+# 将 late_command 脚本写入 preseed 的 late_command
+# 使用 base64 编码避免引号嵌套问题
+# 在 preseed late_command 中：解码脚本到目标系统并执行
+
+# 生成 base64 编码的 late_command 脚本
+LATE_B64=$(base64 -w0 "$LATE_SCRIPT_SRC")
+log_info "late_command 脚本已编码（$(echo "$LATE_B64" | wc -c) 字节）"
 
 # 替换 preseed 中的 late_command
+# 格式：in-target sh -c 'echo BASE64 | base64 -d | sh'
 sed -i '/^d-i preseed\/late_command/d' "$PRESEED_FILE"
-# 复制脚本到目标系统并在目标系统中执行
-cp "$LATE_SCRIPT_SRC" /target"${LATE_SCRIPT_DST}" 2>/dev/null || true
 echo "" >> "$PRESEED_FILE"
 echo "# 阻断 config-drive 自恢复（三重阻断：preseed late_command）" >> "$PRESEED_FILE"
-echo "d-i preseed/late_command string in-target /bin/sh ${LATE_SCRIPT_DST}" >> "$PRESEED_FILE"
+echo "d-i preseed/late_command string in-target sh -c 'echo ${LATE_B64} | base64 -d | sh'" >> "$PRESEED_FILE"
 
 # 在 pkgsel 中排除 cloud-init
 if ! grep -q "cloud-init" "$PRESEED_FILE" 2>/dev/null; then
