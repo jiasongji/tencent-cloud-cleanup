@@ -17,6 +17,7 @@
 - 全面验证从 6 项扩展到 12 项
 - 新增独立验证脚本 `verify_cleanup.sh`
 - 新增远程清理脚本 `remote_cleanup.sh`
+- 新增 DD 重装脚本 `dd-reinstall.sh`，解决 config-drive vendor_data.json 导致 DD 后系统自恢复问题
 
 ### 改进
 - sgdaemon 检测改为 fd 匹配 `sgdaemon.log`，避免误杀正常 sleep 进程

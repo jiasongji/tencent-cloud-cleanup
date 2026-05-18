@@ -229,6 +229,55 @@ curl -sL https://raw.githubusercontent.com/jiasongji/tencent-cloud-cleanup/main/
 
 取决于安装的组件数量。在 2核2G 的轻量应用服务器上，通常可以释放 **250-300MB** 内存（从约 500MB 占用降至约 220MB）。
 
+## DD 重装系统方案
+
+腾讯云的 config-drive (`/dev/sr0`, label `config-2`) 包含一个 `vendor_data.json`，其中嵌入了完整的 cloud-init 配置。**无论你 DD 什么新系统，cloud-init 检测到 config-drive 后都会自动重新安装所有腾讯组件。**
+
+这就是"DD 重装后总是回到原系统"的根本原因。
+
+### 自恢复链路
+
+```
+启动 → cloud-init 检测 config-drive(/dev/sr0)
+     → 读取 vendor_data.json
+     → bootcmd: 复制 cloudRun.sh 到 per-boot 目录
+     → runcmd: 挂载 config-drive, 复制 /qcloud_init/
+     → runcmd: 执行 cvm_init.sh
+     → 安装 YunJing + Stargate + TAT + Barad 等全部组件
+     → 设置 root 密码、hostname、NTP
+     → 系统回到腾讯云初始状态
+```
+
+### 解决方案
+
+本项目提供了一键 DD 重装脚本 `dd-reinstall.sh`，通过在 preseed 的 `late_command` 中执行以下操作来彻底阻断：
+
+1. **卸载 cloud-init**：`apt-get purge cloud-init`
+2. **创建禁用标记**：`/etc/cloud/cloud-init.disabled`
+3. **udev 规则忽略 config-drive**：`99-ignore-config-drive.rules`
+4. **禁用 sr_mod 内核模块**：防止加载光驱驱动
+5. **写入静态网络配置**：替代 cloud-init 的网络管理
+6. **清理 fstab 中的 sr0 挂载**：防止自动挂载
+7. **清理残留文件**：删除 `/qcloud_init`、`/usr/local/qcloud` 等
+
+### 使用方法
+
+```bash
+# 上传到服务器
+scp dd-reinstall.sh root@<服务器IP>:/root/
+
+# 登录执行
+ssh root@<服务器IP>
+bash /root/dd-reinstall.sh
+```
+
+### 重装后连接
+
+```bash
+ssh -p 8622 debian@<服务器IP>
+# 密码：Tadminn..
+```
+
 ## 免责声明
 
 本脚本仅供学习和研究使用。使用者需自行承担使用本脚本带来的所有风险和后果。作者不对因使用本脚本而导致的任何直接或间接损失负责。
