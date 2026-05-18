@@ -39,7 +39,8 @@ TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 
 # IPv6（腾讯云控制台分配的地址，留空则不配置 IPv6）
 IPV6_ADDR="${TENCENT_IPV6:-}"
-IPV6_GW="${TENCENT_IPV6_GW:-fe80::1}"
+IPV6_GW="${TENCENT_IPV6_GW:-fe80::feee:ffff:feff:ffff}"
+IPV6_DNS="${IPV6_DNS:-2402:4e00:: 2400:3200::1}"
 
 # debi.sh 下载地址（多重备选，适合中国网络环境）
 DEBI_URLS=(
@@ -185,6 +186,7 @@ echo "  主机名：${NEW_HOSTNAME}"
 echo "  时区：${TIMEZONE}"
 echo "  镜像源：${MIRROR_HOST}（腾讯内网加速）"
 echo "  IPv6：${IPV6_ADDR:-未配置}"
+[ -n "${IPV6_ADDR}" ] && echo "  IPv6 网关：${IPV6_GW}"
 echo "  启动方式：${BOOT_METHOD}"
 echo ""
 
@@ -531,14 +533,19 @@ if [ -n "${IPV6_ADDR}" ] && [ "${IPV6_ADDR}" != "none" ]; then
 # IPv6 配置
 echo '=== 配置 IPv6 ==='
 ip -6 addr add ${IPV6_ADDR}/${IPV6_PREFIX} dev eth0 2>/dev/null || true
-ip -6 route add default via ${IPV6_GW} dev eth0 2>/dev/null || true
+ip -6 route replace ${IPV6_GW} dev eth0 2>/dev/null || true
+ip -6 route replace default via ${IPV6_GW} dev eth0 2>/dev/null || true
 cat >> /etc/network/interfaces << 'IPV6EOF'
 
 # IPv6
 iface eth0 inet6 static
-    address ${IPV6_ADDR}
-    netmask ${IPV6_PREFIX}
-    gateway ${IPV6_GW}
+    address ${IPV6_ADDR}/${IPV6_PREFIX}
+    accept_ra 0
+    autoconf 0
+    dns-nameservers ${IPV6_DNS}
+    post-up ip -6 route replace ${IPV6_GW} dev eth0 || true
+    post-up ip -6 route replace default via ${IPV6_GW} dev eth0 || true
+    pre-down ip -6 route del default via ${IPV6_GW} dev eth0 2>/dev/null || true
 IPV6EOF
 echo 'IPv6 配置完成'
 IPV6BLOCK

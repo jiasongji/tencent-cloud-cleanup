@@ -115,7 +115,7 @@
 ### 方式一：直接上传运行
 
 ```bash
-scp remove_tencent_cloud.sh verify_cleanup.sh kexec_debi_installer.sh root@<服务器IP>:/tmp/
+scp remove_tencent_cloud.sh verify_cleanup.sh kexec_debi_installer.sh configure_ipv6.sh root@<服务器IP>:/tmp/
 ssh root@<服务器IP> 'bash /tmp/remove_tencent_cloud.sh'
 ```
 
@@ -322,6 +322,42 @@ KEXEC_CONFIRM=1 bash kexec_debi_installer.sh
 NEW_PASSWORD='你的新系统密码' bash dd-reinstall.sh
 # 最后提示时输入 BOOT
 ```
+
+### DD 后配置腾讯云 IPv6
+
+腾讯云轻量 DD 后如果只剩 `fe80::/64` 链路本地地址，需要把控制台分配的 IPv6 手动写回系统。参考 `ubuntu-cloud-desktop` 的网络逻辑：优先保留旧系统 IPv6 地址/网关；当 SLAAC/DHCPv6 不可用或地址不一致时，改用静态 IPv6，并先添加网关的 on-link 路由，再添加默认路由。
+
+推荐直接使用脚本：
+
+```bash
+# 从腾讯云控制台复制 IPv6 地址；不要把真实地址提交到公开仓库
+TENCENT_IPV6='你的腾讯云IPv6地址' bash configure_ipv6.sh
+```
+
+脚本默认值适配腾讯云中国大陆环境：
+
+```bash
+IFACE=eth0
+TENCENT_IPV6_PREFIX=64
+TENCENT_IPV6_GW='fe80::feee:ffff:feff:ffff'
+IPV6_DNS='2402:4e00:: 2400:3200::1'
+```
+
+它会即时执行等价操作：
+
+```bash
+ip -6 addr add <IPv6>/64 dev eth0
+ip -6 route replace fe80::feee:ffff:feff:ffff dev eth0
+ip -6 route replace default via fe80::feee:ffff:feff:ffff dev eth0
+```
+
+并写入持久化配置：
+
+- `/etc/network/interfaces`：追加 `iface eth0 inet6 static` 管理块
+- `/etc/sysctl.d/99-tencent-ipv6.conf`：开启 IPv6，关闭错误的 RA/autoconf 兜底
+- `/etc/resolv.conf`：保留 IPv4 DNS，并补充腾讯/国内 IPv6 DNS
+
+如果你的实例控制台显示的 IPv6 网关不是默认值，用 `TENCENT_IPV6_GW='...'` 覆盖。
 
 ### 中国大陆网络说明
 

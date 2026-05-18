@@ -4,10 +4,12 @@
 
 ### 新增
 - 新增 `kexec_debi_installer.sh`：debi.sh 已生成 `/boot/debian-*` 后，可绕过 GRUB 直接进入 Debian Installer。
+- 新增 `configure_ipv6.sh`：DD 后按腾讯云控制台 IPv6 地址恢复静态 IPv6、on-link 网关路由和国内 IPv6 DNS。
 - `dd-reinstall.sh` 升级到 v2.1，默认优先使用 kexec 进入安装器，避免腾讯云轻量实例重启后仍回旧系统。
 
 ### 修复
 - `dd-reinstall.sh` 修补 preseed 后会重新追加嵌入 initrd，确保 late_command 在安装器中生效。
+- `dd-reinstall.sh` 的 IPv6 网关默认值改为腾讯云常用 `fe80::feee:ffff:feff:ffff`，并使用 `post-up` 写入默认路由。
 - `verify_cleanup.sh` 新增当前 `/proc/cmdline` 检查，识别实际启动链未消费当前 GRUB 参数的情况。
 
 ## v3.3 (2026-05-18)
