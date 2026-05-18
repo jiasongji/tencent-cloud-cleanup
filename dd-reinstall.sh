@@ -261,9 +261,9 @@ update-grub 2>/dev/null || grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null ||
 # 注意：debi.sh 内部使用 stty -echo 读取密码，在非 PTY 环境会失败
 # 即使已通过 --password 提供密码，stty 仍会报错
 # 解决方案：patch debi.sh 跳过 stty 调用
-sed -i 's/^stty -echo$/# stty -echo/' "${DEBI_SH}"
-sed -i "s/^    stty echo$/    # stty echo/" "${DEBI_SH}"
-sed -i "s/trap 'stty echo' EXIT/# trap 'stty echo' EXIT/" "${DEBI_SH}"
+sed -i 's/stty -echo/# stty -echo/g' "${DEBI_SH}"
+sed -i "s/stty echo/# stty echo/g" "${DEBI_SH}"
+sed -i "s/trap 'stty echo' EXIT/# trap 'stty echo' EXIT/g" "${DEBI_SH}"
 log_info "已修补 debi.sh（跳过 stty 调用）"
 
 # 执行 debi.sh
