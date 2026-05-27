@@ -103,36 +103,30 @@ EOF
     if [ -f /etc/network/interfaces ]; then
         backup="/etc/network/interfaces.bak.tencent-ipv6.$(date +%s)"
         cp /etc/network/interfaces "$backup"
-        python3 - "$IFACE" "$IPV6_ADDR" "$IPV6_GW" "$IPV6_DNS" <<'PY'
-from pathlib import Path
-import sys
-iface, addr, gw, dns = sys.argv[1:5]
-path = Path('/etc/network/interfaces')
-text = path.read_text() if path.exists() else ''
-start = f'# BEGIN tencent-cloud-cleanup ipv6 {iface}'
-end = f'# END tencent-cloud-cleanup ipv6 {iface}'
-while start in text and end in text:
-    before, rest = text.split(start, 1)
-    _, after = rest.split(end, 1)
-    text = before.rstrip() + '\n' + after.lstrip('\n')
-if f'auto {iface}' not in text and f'allow-hotplug {iface}' not in text:
-    text = text.rstrip() + f'\n\nauto {iface}\n'
-if f'iface {iface} inet ' not in text:
-    text = text.rstrip() + f'\niface {iface} inet dhcp\n'
-block = f'''
-{start}
-iface {iface} inet6 static
-    address {addr}
+
+        # 删除旧的 BEGIN/END 块（如果存在）
+        MARKER_START="# BEGIN tencent-cloud-cleanup ipv6 ${IFACE}"
+        MARKER_END="# END tencent-cloud-cleanup ipv6 ${IFACE}"
+        if grep -qF "$MARKER_START" /etc/network/interfaces 2>/dev/null; then
+            # 用 sed 删除标记块（兼容 BSD/GNU sed）
+            sed -i "/${MARKER_START}/,/${MARKER_END}/d" /etc/network/interfaces 2>/dev/null || \
+            sed -e "/${MARKER_START}/,/${MARKER_END}/d" -i '' /etc/network/interfaces 2>/dev/null || true
+        fi
+
+        # 追加 IPv6 静态配置
+        cat >> /etc/network/interfaces <<EOF
+
+${MARKER_START}
+iface ${IFACE} inet6 static
+    address ${IPV6_ADDR}
     accept_ra 0
     autoconf 0
-    dns-nameservers {dns}
-    post-up ip -6 route replace {gw} dev {iface} || true
-    post-up ip -6 route replace default via {gw} dev {iface} || true
-    pre-down ip -6 route del default via {gw} dev {iface} 2>/dev/null || true
-{end}
-'''
-path.write_text(text.rstrip() + '\n' + block)
-PY
+    dns-nameservers ${IPV6_DNS}
+    post-up ip -6 route replace ${IPV6_GW} dev ${IFACE} || true
+    post-up ip -6 route replace default via ${IPV6_GW} dev ${IFACE} || true
+    pre-down ip -6 route del default via ${IPV6_GW} dev ${IFACE} 2>/dev/null || true
+${MARKER_END}
+EOF
         log_info "已更新 /etc/network/interfaces（备份: $backup）"
     else
         log_warn "未找到 /etc/network/interfaces，已跳过 ifupdown 持久化配置"
